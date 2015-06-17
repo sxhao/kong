@@ -235,8 +235,7 @@ function BaseDao:_execute_kong_query(operation, args_to_bind, options)
   end
 
   -- Execute statement
-  local results, err
-  results, err = self:_execute(statement, args, options)
+  local results, err = self:_execute(statement, args, options)
   if err and err.cassandra_err_code == cassandra_constants.error_codes.UNPREPARED then
     if ngx then
       ngx.log(ngx.NOTICE, "Cassandra did not recognize prepared statement \""..cache_key.."\". Re-preparing it and re-trying the query. (Error: "..err..")")
@@ -301,6 +300,58 @@ function BaseDao:prepare_kong_statement(kong_query)
   end
 end
 
+function BaseDao:check_unique_fields(t, is_update)
+  local errors
+
+  for k, field in pairs(self._schema.fields) do
+    if field.unique and t[k] ~= nil then
+      local res, err = self:find_by_keys {[k] = t[k]}
+      if err then
+        return false, nil, "Error during UNIQUE check: "..err.message
+      elseif res and #res > 0 then
+        local is_self = true
+        if is_update then
+          -- If update, check if the retrieved entity is not the entity itself
+          res = res[1]
+          for key_k, key_v in ipairs(self._primary_key) do
+            if t[key_k] ~= res[key_k] then
+              is_self = false
+              break
+            end
+          end
+        else
+          is_self = false
+        end
+
+        if not is_self then
+          errors = utils.add_error(errors, k, k.." already exists with value '"..t[k].."'")
+        end
+      end
+    end
+  end
+
+  return errors == nil, errors
+end
+
+function BaseDao:check_foreign_fields(t)
+  local errors, foreign_type, foreign_field, res, err
+
+  for k, field in pairs(self._schema.fields) do
+    if field.foreign ~= nil and type(field.foreign) == "string" then
+      foreign_type, foreign_field = unpack(stringy.split(field.foreign, ":"))
+      if foreign_type and foreign_field and self._factory[foreign_type] and t[k] ~= nil and t[k] ~= constants.DATABASE_NULL_ID then
+        res, err = self._factory[foreign_type]:find_by_keys {[foreign_field] = t[k]}
+        if err then
+          return false, nil, "Error during FOREIGN check: "..err.message
+        elseif not res or #res == 0 then
+          errors = utils.add_error(errors, k, k.." "..t[k].." does not exist")
+        end
+      end
+    end
+  end
+
+  return errors == nil, errors
+end
 
 -- Execute the INSERT kong_query of a DAO entity.
 -- Validates the entity's schema + UNIQUE values + FOREIGN KEYS.
@@ -311,10 +362,10 @@ function BaseDao:insert(t)
   assert(t ~= nil, "Cannot insert a nil element")
   assert(type(t) == "table", "Entity to insert must be a table")
 
-  local ok, err, errors
+  local ok, db_err, errors
 
   -- Populate the entity with any default/overriden values and validate it
-  err = validations.validate(t, self, {
+  errors = validations.validate(t, self, {
     dao_insert = function(field)
       if field.type == "id" then
         return uuid()
@@ -323,15 +374,29 @@ function BaseDao:insert(t)
       end
     end
   })
-  if err then
-    return nil, err
+  if errors then
+    return nil, errors
   end
 
-  ok, err = validations.on_insert(t, self._schema, self._factory)
+  ok, errors = validations.on_insert(t, self._schema, self._factory)
   if not ok then
-    return nil, err
+    return nil, errors
   end
 
+  ok, errors, db_err = self:check_unique_fields(t)
+  if db_err then
+    return nil, DaoError(db_err, error_types.DATABASE)
+  elseif not ok then
+    return nil, DaoError(errors, error_types.UNIQUE)
+  end
+
+  ok, errors, db_err = self:check_foreign_fields(t)
+  if db_err then
+    return nil, DaoError(db_err, error_types.DATABASE)
+  elseif not ok then
+    return nil, DaoError(errors, error_types.FOREIGN)
+  end
+  
   local insert_q, columns = query_builder.insert(self._table, t)
   local _, stmt_err = self:_execute_kong_query({ query = insert_q, args_keys = columns }, self:_marshall(t))
   if stmt_err then
@@ -350,7 +415,7 @@ function BaseDao:update(t)
   assert(t ~= nil, "Cannot update a nil element")
   assert(type(t) == "table", "Entity to update must be a table")
 
-  local ok, err, errors
+  local ok, db_err, errors
 
   -- Extract primary keys from the entity
   local t_without_primary_keys = utils.deep_copy(t)
@@ -369,9 +434,23 @@ function BaseDao:update(t)
   end
 
   -- Validate schema
-  err = validations.validate(t, self, { is_update = next(t_without_primary_keys) ~= nil, primary_key = t_only_primary_keys}) -- hack
-  if err then
-    return nil, err
+  errors = validations.validate(t, self, { is_update = next(t_without_primary_keys) ~= nil, primary_key = t_only_primary_keys}) -- hack
+  if errors then
+    return nil, errors
+  end
+
+  ok, errors, db_err = self:check_unique_fields(t, true)
+  if db_err then
+    return nil, DaoError(db_err, error_types.DATABASE)
+  elseif not ok then
+    return nil, DaoError(errors, error_types.UNIQUE)
+  end
+
+  ok, errors, db_err = self:check_foreign_fields(t)
+  if db_err then
+    return nil, DaoError(db_err, error_types.DATABASE)
+  elseif not ok then
+    return nil, DaoError(errors, error_types.FOREIGN)
   end
 
   local update_q, columns = query_builder.update(self._table, t_without_primary_keys, t_only_primary_keys, self._primary_key)
